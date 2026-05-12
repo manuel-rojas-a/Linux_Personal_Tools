@@ -1,0 +1,339 @@
+
+---
+# =============================================================
+# Ansible Playbook: CVE-2026-31431 (Copy Fail)
+# CVSS: 7.8 (High) | Divulgado: 2026-04-29
+# Afecta: Linux kernel con algif_aead desde 2017
+# Fix upstream: commit a664bf3d603d (kernel 7.0-rc7)
+# Ref: https://copy.fail | https://ubuntu.com/security/CVE-2026-31431
+# =============================================================
+
+- name: "CVE-2026-31431 (Copy Fail) - Detección, Mitigación y Parche"
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    reboot_after_patch: true    # false si no puedes reiniciar ahora
+    mitigation_only: false      # true = solo mitiga, no actualiza kernel
+
+    # -------------------------------------------------------
+    # Versiones de kmod con mitigación integrada (Ubuntu)
+    # Fuente: ubuntu.com/blog/copy-fail-vulnerability-fixes-available
+    # -------------------------------------------------------
+    ubuntu_safe_kmod_versions:
+      "14.04": "15-0ubuntu7+esm1"
+      "16.04": "22-1ubuntu5.2+esm1"
+      "18.04": "24-1ubuntu3.5+esm1"
+      "20.04": "27-1ubuntu2.1+esm1"
+      "22.04": "29-1ubuntu1.1"
+      "24.04": "31+20240202-2ubuntu7.2"
+      "25.10": "34.2-2ubuntu1.1"
+      # 26.04 (Resolute) NO está afectada
+
+    # -------------------------------------------------------
+    # Ubuntu 14.04/16.04: solo kernel 4.15 es vulnerable,
+    # 3.13 y 4.4 NO están afectados
+    # -------------------------------------------------------
+    ubuntu_safe_kernel_exceptions:
+      "14.04": ["3.13", "4.4"]
+      "16.04": ["4.4"]
+
+  # ===========================================================
+  # BLOQUE 1: DETECCIÓN AUTOMÁTICA DE VULNERABILIDAD
+  # ===========================================================
+  tasks:
+
+    - name: "DETECCIÓN | Obtener versión del kernel activo"
+      ansible.builtin.command: uname -r
+      register: current_kernel
+      changed_when: false
+      check_mode: false 
+
+    - name: "DETECCIÓN | Verificar si algif_aead está cargado en memoria"
+      ansible.builtin.command: grep -c '^algif_aead ' /proc/modules
+      register: module_loaded
+      changed_when: false
+      failed_when: false
+
+    - name: "DETECCIÓN | Verificar si AF_ALG está en uso activamente (lsof)"
+      ansible.builtin.shell: lsof 2>/dev/null | grep -c AF_ALG || true
+      register: aflalg_in_use
+      changed_when: false
+      failed_when: false
+
+    # -------------------------------------------------------
+    # Detección específica Debian/Ubuntu
+    # -------------------------------------------------------
+    - name: "DETECCIÓN | [Debian/Ubuntu] Obtener versión de kmod instalada"
+      ansible.builtin.command: dpkg-query -W -f='${Version}' kmod
+      register: kmod_installed_version
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == "Debian"
+
+    - name: "DETECCIÓN | [Ubuntu] Verificar si la versión del OS está afectada"
+      ansible.builtin.set_fact:
+        ubuntu_release: "{{ ansible_distribution_version }}"
+        ubuntu_safe_kmod: >-
+          {{ ubuntu_safe_kmod_versions[ansible_distribution_version] | default('N/A') }}
+        ubuntu_not_affected: >-
+          {{ ansible_distribution_version is version('26.04', '>=') }}
+      when:
+        - ansible_distribution == "Ubuntu"
+
+    - name: "DETECCIÓN | [Ubuntu 14/16] Verificar si kernel major.minor es excepción segura"
+      ansible.builtin.set_fact:
+        kernel_major_minor: >-
+          {{ current_kernel.stdout.split('-')[0] | regex_replace('^(\d+\.\d+).*', '\1') }}
+      when:
+        - ansible_distribution == "Ubuntu"
+        - ansible_distribution_version in ['14.04', '16.04']
+
+    - name: "DETECCIÓN | [Ubuntu 14/16] Marcar como no afectado si kernel es versión segura"
+      ansible.builtin.set_fact:
+        kernel_is_safe_exception: >-
+          {{ kernel_major_minor in ubuntu_safe_kernel_exceptions[ansible_distribution_version] }}
+      when:
+        - ansible_distribution == "Ubuntu"
+        - ansible_distribution_version in ['14.04', '16.04']
+        - kernel_major_minor is defined
+
+    # -------------------------------------------------------
+    # Detección RHEL/AlmaLinux: verificar initcall_blacklist
+    # -------------------------------------------------------
+    - name: "DETECCIÓN | [RHEL] Verificar si ya tiene initcall_blacklist aplicado"
+      ansible.builtin.command: grep -c 'initcall_blacklist=algif_aead_init' /proc/cmdline
+      register: rhel_mitigation_active
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == "RedHat"
+
+    # -------------------------------------------------------
+    # Evaluar estado de vulnerabilidad por host
+    # -------------------------------------------------------
+    - name: "DETECCIÓN | Evaluar estado de vulnerabilidad"
+      ansible.builtin.set_fact:
+        host_is_vulnerable: >-
+          {{
+            (ansible_distribution == "Ubuntu" and
+             not (ubuntu_not_affected | default(false) | bool) and
+             not (kernel_is_safe_exception | default(false) | bool))
+            or
+            (ansible_os_family == "RedHat")
+            or
+            (ansible_os_family == "Debian" and ansible_distribution != "Ubuntu")
+          }}
+        mitigation_already_applied: >-
+          {{
+            (ansible_os_family == "RedHat" and
+             (rhel_mitigation_active.stdout | default('0')) | int > 0)
+            or
+            (ansible_os_family == "Debian" and
+             (module_loaded.stdout | default('1')) | int == 0)
+          }}
+
+    - name: "DETECCIÓN | Resumen del estado por host"
+      ansible.builtin.debug:
+        msg:
+          - "====== CVE-2026-31431 (Copy Fail) - Estado de {{ inventory_hostname }} ======"
+          - "Kernel activo         : {{ current_kernel.stdout }}"
+          - "OS                    : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "algif_aead en memoria : {{ 'SÍ' if (module_loaded.stdout | int > 0) else 'NO' }}"
+          - "AF_ALG en uso (lsof)  : {{ 'SÍ - PRECAUCIÓN al descargar módulo' if (aflalg_in_use.stdout | default('0') | int > 0) else 'NO' }}"
+          - "¿Host vulnerable?     : {{ 'VULNERABLE ⚠️' if host_is_vulnerable else 'No afectado ✓' }}"
+          - "¿Mitigación activa?   : {{ 'Sí ✓' if mitigation_already_applied else 'No aplicada' }}"
+          - >-
+            kmod instalado: {{ kmod_installed_version.stdout | default('N/A') }}
+            | kmod seguro: {{ ubuntu_safe_kmod | default('N/A') }}
+
+    # Saltar el resto si el host NO es vulnerable
+    - name: "Saltar parche en hosts no afectados"
+      ansible.builtin.meta: end_host
+      when: not (host_is_vulnerable | bool)
+
+    # ===========================================================
+    # BLOQUE 2: MITIGACIÓN TEMPORAL - Debian/Ubuntu
+    # (solo si la mitigación aún no está aplicada)
+    # ===========================================================
+    - name: "MITIGACIÓN | [Debian/Ubuntu] Aplicar bloqueo de algif_aead via modprobe.d"
+      when:
+        - ansible_os_family == "Debian"
+        - not (mitigation_already_applied | bool)
+      block:
+        - name: Crear regla modprobe para bloquear algif_aead
+          ansible.builtin.copy:
+            dest: /etc/modprobe.d/disable-algif-aead.conf
+            content: "install algif_aead /bin/false\n"
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Intentar descargar módulo si está activo y no en uso
+          ansible.builtin.command: rmmod algif_aead
+          when:
+            - (module_loaded.stdout | int) > 0
+            - (aflalg_in_use.stdout | default('0') | int) == 0
+          register: rmmod_result
+          failed_when:
+            - rmmod_result.rc != 0
+            - "'not currently loaded' not in rmmod_result.stderr"
+          changed_when: rmmod_result.rc == 0
+
+        - name: Avisar si módulo está en uso (se aplicará al reiniciar)
+          ansible.builtin.debug:
+            msg: >-
+              AVISO: algif_aead está siendo usado por procesos activos.
+              La mitigación se aplicará en el próximo reinicio.
+          when: (aflalg_in_use.stdout | default('0') | int) > 0
+
+    # ===========================================================
+    # BLOQUE 3: MITIGACIÓN TEMPORAL - RHEL/AlmaLinux/Rocky
+    # (modprobe.d NO funciona - módulo compilado en kernel)
+    # ===========================================================
+    - name: "MITIGACIÓN | [RHEL] Bloquear algif_aead via initcall_blacklist (grubby)"
+      when:
+        - ansible_os_family == "RedHat"
+        - not (mitigation_already_applied | bool)
+      block:
+        - name: Agregar initcall_blacklist=algif_aead_init al bootloader
+          ansible.builtin.command: >
+            grubby --update-kernel=ALL
+            --args="initcall_blacklist=algif_aead_init"
+          register: grubby_result
+          changed_when: grubby_result.rc == 0
+
+        - name: Confirmar que el parámetro quedó en la config del kernel
+          ansible.builtin.command: grep -c 'initcall_blacklist=algif_aead_init' /boot/grub2/grub.cfg
+          register: grub_cfg_check
+          changed_when: false
+          failed_when: false
+
+        - name: Advertir si el parámetro no se confirmó en grub.cfg
+          ansible.builtin.debug:
+            msg: >-
+              ADVERTENCIA: No se encontró initcall_blacklist en grub.cfg.
+              Verificar manualmente con: grubby --info=DEFAULT
+          when: (grub_cfg_check.stdout | int) == 0
+
+    # ===========================================================
+    # BLOQUE 4: ACTUALIZACIÓN DEL KERNEL (remediación definitiva)
+    # ===========================================================
+    - name: "PARCHE | [Debian/Ubuntu] Actualizar kernel y kmod"
+      ansible.builtin.apt:
+        name:
+          - linux-image-generic
+          - kmod
+        state: latest
+        update_cache: true
+      when:
+        - ansible_os_family == "Debian"
+        - not mitigation_only
+
+    - name: "PARCHE | [RHEL] Actualizar kernel completo"
+      ansible.builtin.dnf:
+        name: "kernel*"
+        state: latest
+        update_cache: true
+      when:
+        - ansible_os_family == "RedHat"
+        - not mitigation_only
+
+    # ===========================================================
+    # BLOQUE 5: REINICIO
+    # ===========================================================
+    - name: "REINICIO | Reiniciar para aplicar nuevo kernel"
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+        msg: "Reinicio requerido: CVE-2026-31431 (Copy Fail)"
+      when:
+        - reboot_after_patch | bool
+        - not mitigation_only
+
+    # ===========================================================
+    # BLOQUE 6: VERIFICACIÓN POST-PARCHE
+    # ===========================================================
+    - name: "VERIFICACIÓN | Kernel activo post-reinicio"
+      ansible.builtin.command: uname -r
+      register: kernel_post
+      changed_when: false
+
+    - name: "VERIFICACIÓN | Estado de algif_aead post-parche"
+      ansible.builtin.command: grep -c '^algif_aead ' /proc/modules
+      register: module_post
+      changed_when: false
+      failed_when: false
+
+    - name: "VERIFICACIÓN | [Ubuntu] Versión de kmod post-parche"
+      ansible.builtin.command: dpkg-query -W -f='${Version}' kmod
+      register: kmod_post
+      changed_when: false
+      failed_when: false
+      when: ansible_distribution == "Ubuntu"
+
+    - name: "VERIFICACIÓN | Resumen final"
+      ansible.builtin.debug:
+        msg:
+          - "====== Resultado final en {{ inventory_hostname }} ======"
+          - "Kernel activo         : {{ kernel_post.stdout }}"
+          - "algif_aead en memoria : {{ 'AÚN CARGADO ⚠️ - revisar' if (module_post.stdout | int > 0) else 'No cargado ✓' }}"
+          - "kmod post-parche      : {{ kmod_post.stdout | default('N/A') }}"
+          - "Estado                : {{ 'REMEDIADO ✓' if (module_post.stdout | int == 0) else 'VERIFICAR MANUALMENTE ⚠️' }}"
+# ===========================================================
+    # BLOQUE 7: REPORTE CSV
+    # ===========================================================
+
+    # --- Hosts NO afectados (se registran antes del end_host) ---
+    - name: "REPORTE | Registrar hosts no afectados"
+      ansible.builtin.lineinfile:
+        path: "/tmp/copyfail_report_{{ ansible_date_time.epoch }}.csv"
+        line: >-
+          {{ inventory_hostname }},
+          {{ ansible_distribution }} {{ ansible_distribution_version }},
+          {{ current_kernel.stdout }},
+          NO_AFECTADO,
+          {{ kmod_installed_version.stdout | default('N/A') }},
+          {{ ansible_date_time.iso8601 }}
+        create: true
+        insertafter: EOF
+      delegate_to: localhost
+      when: not (host_is_vulnerable | bool)
+
+    - name: "Saltar parche en hosts no afectados"
+      ansible.builtin.meta: end_host
+      when: not (host_is_vulnerable | bool)
+
+    # --- Hosts remediados ---
+    - name: "REPORTE | Construir fila CSV por host remediado"
+      ansible.builtin.set_fact:
+        csv_row: >-
+          {{ inventory_hostname }},
+          {{ ansible_distribution }} {{ ansible_distribution_version }},
+          {{ kernel_post.stdout }},
+          {{ 'REMEDIADO' if (module_post.stdout | int == 0) else 'VERIFICAR' }},
+          {{ kmod_post.stdout | default('N/A') }},
+          {{ ansible_date_time.iso8601 }}
+
+    - name: "REPORTE | Guardar fila en archivo CSV del nodo de control"
+      ansible.builtin.lineinfile:
+        path: "/tmp/copyfail_report_{{ ansible_date_time.epoch }}.csv"
+        line: "{{ csv_row | regex_replace('\\s+', ' ') | trim }}"
+        create: true
+        insertafter: EOF
+      delegate_to: localhost
+
+    # --- Header (una sola vez, al principio) ---
+    - name: "REPORTE | Insertar header CSV"
+      ansible.builtin.lineinfile:
+        path: "/tmp/copyfail_report_{{ ansible_date_time.epoch }}.csv"
+        line: "hostname,os,kernel_version,estado,kmod_version,timestamp"
+        insertbefore: BOF
+        state: present 
+        create: true
+      delegate_to: localhost
+      run_once: true
+
+    - name: "REPORTE | Ruta del archivo generado"
+      ansible.builtin.debug:
+        msg: "CSV guardado en: /tmp/copyfail_report_{{ ansible_date_time.epoch }}.csv"
+      run_once: true
